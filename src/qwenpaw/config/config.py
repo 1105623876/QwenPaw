@@ -7,8 +7,19 @@ import logging
 import re
 import threading
 from pathlib import Path
-from typing import Optional, Union, Dict, List, Literal, Any, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
+from apscheduler.triggers.cron import CronTrigger
 from pydantic import (
     BaseModel,
     Field,
@@ -629,12 +640,21 @@ class AutoMemorySearchConfig(BaseModel):
     )
 
 
+EmbeddingBackend = Literal[
+    "openai",
+    "dashscope",
+    "dashscope_multimodal",
+    "gemini",
+    "ollama",
+]
+
+
 class EmbeddingModelConfig(BaseModel):
     """Embedding model configuration."""
 
     model_config = ConfigDict(extra="ignore")
 
-    backend: str = Field(
+    backend: EmbeddingBackend = Field(
         default="openai",
         description="Embedding backend (openai, etc.)",
     )
@@ -644,7 +664,11 @@ class EmbeddingModelConfig(BaseModel):
     )
     base_url: str = Field(default="", description="Base URL for embedding API")
     model_name: str = Field(default="", description="Embedding model name")
-    dimensions: int = Field(default=1024, description="Embedding dimensions")
+    dimensions: int = Field(
+        default=1024,
+        ge=1,
+        description="Embedding dimensions",
+    )
     enable_cache: bool = Field(
         default=True,
         description="Whether to enable embedding cache",
@@ -655,14 +679,17 @@ class EmbeddingModelConfig(BaseModel):
     )
     max_cache_size: int = Field(
         default=10000,
+        ge=1,
         description="Maximum cache size",
     )
     max_input_length: int = Field(
         default=8192,
+        ge=1,
         description="Maximum input length for embedding",
     )
     max_batch_size: int = Field(
         default=10,
+        ge=1,
         description="Maximum batch size for embedding",
     )
 
@@ -762,17 +789,22 @@ class ReMeLightMemoryConfig(BaseModel):
         default="digest",
         description="Subdirectory for digest memory",
     )
-    summarize_when_compact: bool = Field(
-        default=True,
-        description="Whether to enable memory summarization during compaction",
+    inbox_push_enabled: bool | None = Field(
+        default=None,
+        exclude=True,
+        description="Deprecated shared inbox notification switch",
     )
-
-    inbox_push_enabled: bool = Field(
+    auto_memory_inbox_push_enabled: bool = Field(
         default=True,
-        description=(
-            "Whether to push ReMe auto-memory, auto-dream, and "
-            "auto-resource job results to the inbox"
-        ),
+        description="Whether to push auto-memory results to the inbox",
+    )
+    auto_dream_inbox_push_enabled: bool = Field(
+        default=True,
+        description="Whether to push auto-dream results to the inbox",
+    )
+    daily_paper_inbox_push_enabled: bool = Field(
+        default=True,
+        description="Whether to push Daily Paper results to the inbox",
     )
 
     auto_memory_interval: int | None = Field(
@@ -800,6 +832,29 @@ class ReMeLightMemoryConfig(BaseModel):
         ),
     )
 
+    daily_paper_cron_enabled: bool = Field(
+        default=False,
+        description="Whether to enable the scheduled Daily Paper job",
+    )
+
+    daily_paper_cron: str = Field(
+        default="0 9 * * *",
+        description=(
+            "Cron expression for Daily Paper generation "
+            "(use daily_paper_cron_enabled to enable/disable)"
+        ),
+    )
+
+    daily_paper_use_hf_mirror: bool = Field(
+        default=False,
+        description="Whether Daily Paper uses the Hugging Face mirror",
+    )
+
+    daily_paper_topics: str = Field(
+        default="",
+        description="Topics to prioritize when selecting Daily Paper papers",
+    )
+
     auto_memory_search_config: AutoMemorySearchConfig = Field(
         default_factory=AutoMemorySearchConfig,
     )
@@ -811,6 +866,49 @@ class ReMeLightMemoryConfig(BaseModel):
     reranker_config: RerankerConfig = Field(
         default_factory=RerankerConfig,
     )
+
+    needs_reindex: bool = Field(
+        default=False,
+        description=(
+            "Whether the memory index must be rebuilt after an embedding "
+            "vector-space change"
+        ),
+    )
+
+    memory_search_enabled: bool = Field(
+        default=True,
+        description="Whether to expose the memory_search tool to the agent",
+    )
+
+    @field_validator("dream_cron", "daily_paper_cron")
+    @classmethod
+    def validate_service_cron(cls, value: str) -> str:
+        """Reject expressions that the runtime scheduler cannot install."""
+        if not value.strip():
+            # Preserve compatibility with legacy configs that used an empty
+            # dream cron to disable scheduling before the explicit switches.
+            return value
+        try:
+            CronTrigger.from_crontab(value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid cron expression: {value!r}") from exc
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_shared_inbox_switch(cls, values: Any) -> Any:
+        """Use the legacy shared switch for notification fields not yet set."""
+        if not isinstance(values, dict) or "inbox_push_enabled" not in values:
+            return values
+        migrated = dict(values)
+        legacy_value = bool(values["inbox_push_enabled"])
+        for field_name in (
+            "auto_memory_inbox_push_enabled",
+            "auto_dream_inbox_push_enabled",
+            "daily_paper_inbox_push_enabled",
+        ):
+            migrated.setdefault(field_name, legacy_value)
+        return migrated
 
 
 class ContextCompactConfig(BaseModel):
@@ -2995,6 +3093,37 @@ def save_agent_config(
             agent_config.model_dump(exclude_none=True),
         )
         _agent_config_cache.pop(agent_id, None)
+
+
+async def load_agent_config_async(agent_id: str) -> AgentProfileConfig:
+    """Load an agent configuration without blocking the event loop."""
+    from ..utils.io_utils import run_sync_io
+
+    return await run_sync_io(load_agent_config, agent_id)
+
+
+async def update_agent_config_async(
+    agent_id: str,
+    updater: Callable[[AgentProfileConfig], Any],
+) -> AgentProfileConfig:
+    """Atomically read, mutate, and durably save one agent configuration.
+
+    The complete legacy transaction runs in a worker thread while holding the
+    same re-entrant lock used by synchronous readers and writers. This avoids
+    blocking the event loop without introducing an await boundary between the
+    read and write phases.
+    """
+    from ..utils.io_utils import run_sync_io
+    from .utils import _agent_config_lock
+
+    def update_sync() -> AgentProfileConfig:
+        with _agent_config_lock:
+            agent_config = load_agent_config(agent_id).model_copy(deep=True)
+            updater(agent_config)
+            save_agent_config(agent_id, agent_config)
+            return agent_config
+
+    return await run_sync_io(update_sync)
 
 
 def migrate_legacy_config_to_multi_agent() -> bool:
