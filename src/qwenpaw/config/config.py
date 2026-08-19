@@ -499,6 +499,8 @@ class MatrixConfig(BaseChannelConfig):
     # When True, apply m.mentions + optional pill on outbound messages.
     outbound_structured_mentions: bool = True
     streaming_enabled: bool = False
+    # Keep the legacy room-wide session unless isolation is requested.
+    share_session_in_group: bool = True
 
 
 class VoiceChannelConfig(BaseChannelConfig):
